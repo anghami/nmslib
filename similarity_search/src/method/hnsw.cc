@@ -467,9 +467,11 @@ namespace similarity {
         }
 
         pmgr.CheckUnused();
-        LOG(LIB_INFO) << "Set HNSW query-time parameters:";
-        LOG(LIB_INFO) << "ef(Search)         =" << ef_;
-        LOG(LIB_INFO) << "algoType           =" << searchAlgoType_;
+        // Commenting those lines out because they were filling stderr with useless information on every query,
+        // which needed to be consumed, otherwise the query server would hang
+        // LOG(LIB_INFO) << "Set HNSW query-time parameters:";
+        // LOG(LIB_INFO) << "ef(Search)         =" << ef_;
+        // LOG(LIB_INFO) << "algoType           =" << searchAlgoType_;
     }
 
     template <typename dist_t>
