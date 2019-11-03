@@ -18,6 +18,7 @@
 #include <thread>
 #include <chrono>
 #include <iostream>
+#include <algorithm>
 
 #include "QueryService.h"
 #include <thrift/protocol/TBinaryProtocol.h>
@@ -31,6 +32,7 @@
 #include <boost/program_options.hpp>
 
 #include "params.h"
+#include "space.h"
 #include "params_def.h"
 #include "utils.h"
 #include "space.h"
@@ -43,10 +45,12 @@
 #include "init.h"
 #include "logging.h"
 #include "ztimer.h"
+#include "thread_pool.h"
 
 #define MAX_SPIN_LOCK_QTY 1000000
 #define SLEEP_DURATION    10
 
+#define DATA_FILE_PREF  ".dat"
 
 const unsigned THREAD_COEFF = 4;
 
@@ -94,6 +98,7 @@ class QueryServiceHandler : virtual public QueryServiceIf {
                       const string&                      MethodName,
                       const string&                      LoadIndexLoc,
                       const string&                      SaveIndexLoc,
+                      bool&                              CacheData,
                       const AnyParams&                   IndexParams,
                       const AnyParams&                   QueryTimeParams) :
     debugPrint_(debugPrint),
@@ -102,10 +107,27 @@ class QueryServiceHandler : virtual public QueryServiceIf {
     counter_(0)
 
   {
-    unique_ptr<DataFileInputState> inpState(space_->ReadDataset(dataSet_,
-                                                                externIds_,
-                                                                DataFile,
-                                                                MaxNumData));
+    unique_ptr<DataFileInputState> inpState;
+
+    if (!CacheData || !DoesFileExist(LoadIndexLoc + DATA_FILE_PREF)) {
+      CHECK_MSG(!DataFile.empty(), "Specify the input data file!")
+      inpState = space_->ReadDataset(dataSet_,
+                                         externIds_,
+                                         DataFile,
+                                         MaxNumData);
+      if (CacheData && !SaveIndexLoc.empty()) {
+        LOG(LIB_INFO) << "Saving data to location: " << SaveIndexLoc + DATA_FILE_PREF; 
+
+        space_->WriteObjectVectorBinData(dataSet_, externIds_, SaveIndexLoc + DATA_FILE_PREF);
+      }
+    } else {
+      LOG(LIB_INFO) << "Loading cached data from location: " << LoadIndexLoc + DATA_FILE_PREF; 
+
+      inpState = space_->ReadObjectVectorFromBinData(dataSet_,
+                                                     externIds_,
+                                                     LoadIndexLoc + DATA_FILE_PREF,
+                                                     MaxNumData);
+    }
     space_->UpdateParamsFromFile(*inpState);
 
     CHECK(dataSet_.size() == externIds_.size());
@@ -315,6 +337,7 @@ class QueryServiceHandler : virtual public QueryServiceIf {
       unique_ptr<KNNQueue<dist_t>> res(knn.Result()->Clone());
 
       _return.clear();
+      _return.reserve(k);
 
       wtm.split();
 
@@ -362,9 +385,10 @@ class QueryServiceHandler : virtual public QueryServiceIf {
             objs.insert(objs.begin(), s);
           }
         }
-        _return.insert(_return.begin(), e);
+        _return.push_back(e);
         res->Pop();
       }
+      std::reverse(_return.begin(), _return.end());
       if (debugPrint_) {
         for (size_t i = 0; i < ids.size(); ++i) {
           LOG(LIB_INFO) << "id=" << ids[i] << " dist=" << dists[i] << ( retExternId ? " " + externIds[i] : string(""));
@@ -381,6 +405,62 @@ class QueryServiceHandler : virtual public QueryServiceIf {
         throw qe;
     }
 
+
+  }
+
+  void knnQueryBatch(ReplyEntryListBatch& _return, const int32_t k,
+                     const std::vector<std::string>& queryObjs, const bool retExternId,
+                     const bool retObj, const int32_t numThreads) {
+    // This will increase the counter and prevent modification of query time parameters.
+    LockedCounterManager  mngr(counter_, mtx_);
+
+    try {
+      _return.clear();
+      _return.resize(queryObjs.size());
+
+      ParallelFor(0, queryObjs.size(), numThreads, [&](size_t queryIndex, size_t threadId) {
+        unique_ptr<Object>  queryObj(space_->CreateObjFromStr(0, -1, queryObjs[queryIndex], NULL));
+        KNNQuery<dist_t> knn(*space_, queryObj.get(), k);
+        index_->Search(&knn, -1);
+        unique_ptr<KNNQueue<dist_t>> res(knn.Result()->Clone());
+
+        _return[queryIndex].reserve(k);
+        while (!res->Empty()) {
+          const Object* topObj = res->TopObject();
+          dist_t topDist = res->TopDistance();
+
+          ReplyEntry e;
+
+          e.__set_id(topObj->id());
+          e.__set_dist(topDist);
+
+          string externId;
+
+          if (retExternId || retObj) {
+            CHECK(e.id < externIds_.size());
+            externId = externIds_[e.id];
+            e.__set_externId(externId);
+          }
+
+          if (retObj) {
+            const string& s = space_->CreateStrFromObj(topObj, externId);
+            e.__set_obj(s);
+          }
+          _return[queryIndex].push_back(e);
+          res->Pop();
+        }
+        std::reverse(_return[queryIndex].begin(), _return[queryIndex].end());
+      });
+
+    } catch (const exception& e) {
+      QueryException qe;
+      qe.__set_message(e.what());
+      throw qe;
+    } catch (...) {
+      QueryException qe;
+      qe.__set_message("Unknown exception");
+      throw qe;
+    }
 
   }
 
@@ -408,6 +488,7 @@ void ParseCommandLineForServer(int argc, char*argv[],
                       bool&                   debugPrint,
                       string&                 LoadIndexLoc,
                       string&                 SaveIndexLoc,
+                      bool&                   CacheData,
                       int&                    port,
                       size_t&                 threadQty,
                       string&                 LogFile,
@@ -435,11 +516,12 @@ void ParseCommandLineForServer(int argc, char*argv[],
     (LOG_FILE_PARAM_OPT.c_str(),      po::value<string>(&LogFile)->default_value(LOG_FILE_PARAM_DEFAULT), LOG_FILE_PARAM_MSG.c_str())
     (SPACE_TYPE_PARAM_OPT.c_str(),    po::value<string>(&spaceParamStr)->required(),                SPACE_TYPE_PARAM_MSG.c_str())
     (DIST_TYPE_PARAM_OPT.c_str(),     po::value<string>(&DistType)->default_value(DIST_TYPE_FLOAT), DIST_TYPE_PARAM_MSG.c_str())
-    (DATA_FILE_PARAM_OPT.c_str(),     po::value<string>(&DataFile)->required(),                     DATA_FILE_PARAM_MSG.c_str())
+    (DATA_FILE_PARAM_OPT.c_str(),     po::value<string>(&DataFile)->default_value(""),              DATA_FILE_PARAM_MSG.c_str())
     (MAX_NUM_DATA_PARAM_OPT.c_str(),  po::value<unsigned>(&MaxNumData)->default_value(MAX_NUM_DATA_PARAM_DEFAULT), MAX_NUM_DATA_PARAM_MSG.c_str())
-    (METHOD_PARAM_OPT.c_str(),        po::value<string>(&MethodName)->default_value(METHOD_PARAM_DEFAULT), METHOD_PARAM_MSG.c_str())
+    (METHOD_PARAM_OPT.c_str(),        po::value<string>(&MethodName)->required(), METHOD_PARAM_MSG.c_str())
     (LOAD_INDEX_PARAM_OPT.c_str(),    po::value<string>(&LoadIndexLoc)->default_value(LOAD_INDEX_PARAM_DEFAULT),   LOAD_INDEX_PARAM_MSG.c_str())
     (SAVE_INDEX_PARAM_OPT.c_str(),    po::value<string>(&SaveIndexLoc)->default_value(SAVE_INDEX_PARAM_DEFAULT),   SAVE_INDEX_PARAM_MSG.c_str())
+    ("cacheData",                     po::bool_switch(&CacheData), "save/load data together with the index")
     (QUERY_TIME_PARAMS_PARAM_OPT.c_str(), po::value<string>(&queryTimeParamStr)->default_value(""), QUERY_TIME_PARAMS_PARAM_MSG.c_str())
     (INDEX_TIME_PARAMS_PARAM_OPT.c_str(), po::value<string>(&indexTimeParamStr)->default_value(""), INDEX_TIME_PARAMS_PARAM_MSG.c_str())
     ;
@@ -487,11 +569,11 @@ void ParseCommandLineForServer(int argc, char*argv[],
       QueryTimeParams = shared_ptr<AnyParams>(new AnyParams(desc));
     }
     
-    if (DataFile.empty()) {
+    if (DataFile.empty() && !CacheData) {
       LOG(LIB_FATAL) << "data file is not specified!";
     }
 
-    if (!DoesFileExist(DataFile)) {
+    if (!CacheData && !DoesFileExist(DataFile)) {
       LOG(LIB_FATAL) << "data file " << DataFile << " doesn't exist";
     }
   } catch (const exception& e) {
@@ -514,6 +596,7 @@ int main(int argc, char *argv[]) {
   std::shared_ptr<AnyParams>     IndexParams;
   std::shared_ptr<AnyParams>     QueryTimeParams;
 
+  bool        CacheData;
   string      LoadIndexLoc;
   string      SaveIndexLoc;
 
@@ -521,6 +604,7 @@ int main(int argc, char *argv[]) {
                       debugPrint,
                       LoadIndexLoc,
                       SaveIndexLoc,
+                      CacheData,
                       port,
                       threadQty,
                       LogFile,
@@ -549,6 +633,7 @@ int main(int argc, char *argv[]) {
                                                     MethodName,
                                                     LoadIndexLoc,
                                                     SaveIndexLoc,
+                                                    CacheData,
                                                     *IndexParams,
                                                     *QueryTimeParams));
   } else if (DIST_TYPE_FLOAT == DistType) {
@@ -560,6 +645,7 @@ int main(int argc, char *argv[]) {
                                                     MethodName,
                                                     LoadIndexLoc,
                                                     SaveIndexLoc,
+                                                    CacheData,
                                                     *IndexParams,
                                                     *QueryTimeParams));
   } else if (DIST_TYPE_DOUBLE == DistType) {
@@ -571,6 +657,7 @@ int main(int argc, char *argv[]) {
                                                     MethodName,
                                                     LoadIndexLoc,
                                                     SaveIndexLoc,
+                                                    CacheData,
                                                     *IndexParams,
                                                     *QueryTimeParams));
   
@@ -578,18 +665,18 @@ int main(int argc, char *argv[]) {
     LOG(LIB_FATAL) << "Unknown distance value type: " << DistType;
   }
 
-  boost::shared_ptr<QueryServiceIf> handler(queryHandler.get());
-  boost::shared_ptr<TProcessor> processor(new QueryServiceProcessor(handler));
-  boost::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
-  boost::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
-  boost::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
+  ::apache::thrift::stdcxx::shared_ptr<QueryServiceIf> handler(queryHandler.get());
+  ::apache::thrift::stdcxx::shared_ptr<TProcessor> processor(new QueryServiceProcessor(handler));
+  ::apache::thrift::stdcxx::shared_ptr<TServerTransport> serverTransport(new TServerSocket(port));
+  ::apache::thrift::stdcxx::shared_ptr<TTransportFactory> transportFactory(new TBufferedTransportFactory());
+  ::apache::thrift::stdcxx::shared_ptr<TProtocolFactory> protocolFactory(new TBinaryProtocolFactory());
 
 #if SIMPLE_SERVER
   TSimpleServer server(processor, serverTransport, transportFactory, protocolFactory);
   LOG(LIB_INFO) << "Started a simple server.";
 #else
-  boost::shared_ptr<ThreadManager> threadManager = ThreadManager::newSimpleThreadManager(threadQty);
-  boost::shared_ptr<PosixThreadFactory> threadFactory = boost::shared_ptr<PosixThreadFactory>(new PosixThreadFactory());
+  ::apache::thrift::stdcxx::shared_ptr<ThreadManager> threadManager = ThreadManager::newSimpleThreadManager(threadQty);
+  ::apache::thrift::stdcxx::shared_ptr<PosixThreadFactory> threadFactory = ::apache::thrift::stdcxx::shared_ptr<PosixThreadFactory>(new PosixThreadFactory());
   threadManager->threadFactory(threadFactory);
   threadManager->start();
   TThreadPoolServer server(processor,

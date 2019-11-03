@@ -11,3 +11,5 @@ similarity_search/test/Makefile
 *.so
 *.pyc
 *.egg-info/
+.idea
+dist/

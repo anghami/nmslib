@@ -15,8 +15,13 @@
 #include <cmath>
 #include <memory>
 #include <iostream>
+#include <cstddef>
 // This is only for _mm_prefetch
 #include <mmintrin.h>
+
+#if defined(_WIN32) || defined(WIN32)
+#include <intrin.h>
+#endif
 
 #include "portable_simd.h"
 #include "space.h"
@@ -147,7 +152,21 @@ void SmallWorldRand<dist_t>::AddBatch(const ObjectVector& batchData,
                 << " futureNextNodeId + 1 after batch addition: " << futureNextNodeId;
 
   // 2) One entry should be added before all the threads are started, or else add() will not work properly  
-  addCriticalSection(new MSWNode(batchData[0], NextNodeId_));
+
+
+  bool isEmpty = false;
+
+  {
+    unique_lock<mutex> lock(ElListGuard_);
+    isEmpty = ElList_.empty();
+  }
+  int start_add=0;
+
+  if (isEmpty){
+    addCriticalSection(new MSWNode(batchData[0], NextNodeId_));
+    start_add = 1;
+  }
+
 
   unique_ptr<ProgressDisplay> progress_bar(bPrintProgress ?
                                 new ProgressDisplay(batchData.size(), cerr)
@@ -156,7 +175,7 @@ void SmallWorldRand<dist_t>::AddBatch(const ObjectVector& batchData,
   if (indexThreadQty_ <= 1) {
     // Skip the first element, one element is already added
     if (progress_bar) ++(*progress_bar);
-    for (size_t id = 1; id < batchData.size(); ++id) {
+    for (size_t id = start_add; id < batchData.size(); ++id) {
       MSWNode* node = new MSWNode(batchData[id], id + NextNodeId_);
       add(node, futureNextNodeId);
       if (progress_bar) ++(*progress_bar);
@@ -216,7 +235,7 @@ void SmallWorldRand<dist_t>::DeleteBatch(const vector<IdType>& batchData, int de
     CHECK_MSG(it != ElList_.end(), "An attempt to delete a non-existing object with id=" + ConvertToString(objId));
     MSWNode* delNode=it->second;
     IdType   delNodeId = delNode->getId();
-    CHECK(delNodeId < (ssize_t)delNodesBitset.size());
+    CHECK(delNodeId < (ptrdiff_t)delNodesBitset.size());
     delNodesBitset[delNodeId]=true;
     vToDelNodes.push_back(delNode);
     ElList_.erase(it);
@@ -224,7 +243,7 @@ void SmallWorldRand<dist_t>::DeleteBatch(const vector<IdType>& batchData, int de
   for (MSWNode* node: vToDelNodes) {
     for (MSWNode* pNeighbor : node->getAllFriends()) {
       IdType neighbNodeId = pNeighbor->getId();
-      CHECK(neighbNodeId < (ssize_t)delNodesBitset.size());
+      CHECK(neighbNodeId < (ptrdiff_t)delNodesBitset.size());
       if (!delNodesBitset.at(neighbNodeId))
         vToPatchNodes.push_back(pNeighbor);
     }
@@ -246,31 +265,42 @@ void SmallWorldRand<dist_t>::DeleteBatch(const vector<IdType>& batchData, int de
   mutex mtx;
   vector<thread> threads;
 
-  for (size_t i = 0; i < indexThreadQty_; ++i) {
-    threads.push_back(thread(
-      [&]() {
-        MSWNode* node = nullptr;
-        vector<MSWNode*> cacheDelNode;
-        while(GetNextQueueObj(mtx, toPatchQueue, node)) {
-          if (kNone == patchStrat) node->removeGivenFriends(delNodesBitset);
-          else node->removeGivenFriendsPatchWithClosestNeighbor<dist_t>(space_, use_proxy_dist_, 
-                                                                        delNodesBitset, cacheDelNode);
-        }
-      }
-    ));
-  }
-  for (auto& thread : threads) thread.join();
+  if (indexThreadQty_ <= 1) {
+    LOG(LIB_INFO) << "Single threaded batch delete: " << vToPatchNodes.size();
+    MSWNode* node = nullptr;
+    vector<MSWNode*> cacheDelNode;
+    while(GetNextQueueObj(mtx, toPatchQueue, node)) {
+      if (kNone == patchStrat) node->removeGivenFriends(delNodesBitset);
+      else node->removeGivenFriendsPatchWithClosestNeighbor<dist_t>(space_, use_proxy_dist_,
+                                                                    delNodesBitset, cacheDelNode);
+    }
 
+  } else {
+    for (size_t i = 0; i < indexThreadQty_; ++i) {
+      threads.push_back(thread(
+        [&]() {
+          MSWNode* node = nullptr;
+          vector<MSWNode*> cacheDelNode;
+          while(GetNextQueueObj(mtx, toPatchQueue, node)) {
+            if (kNone == patchStrat) node->removeGivenFriends(delNodesBitset);
+            else node->removeGivenFriendsPatchWithClosestNeighbor<dist_t>(space_, use_proxy_dist_,
+                                                                          delNodesBitset, cacheDelNode);
+          }
+        }
+      ));
+    }
+    for (auto& thread : threads) thread.join();
+  }
 
   if (checkIDs) {
     for (auto it : ElList_) {
       MSWNode* node = it.second;
       IdType   nodeId = node->getId();
-      CHECK(nodeId < (ssize_t)delNodesBitset.size());
+      CHECK(nodeId < (ptrdiff_t)delNodesBitset.size());
       CHECK(!delNodesBitset.at(nodeId));
       for (MSWNode* neighb : node->getAllFriends()) {
         IdType   neighNodeId = neighb->getId();
-        CHECK(neighNodeId < (ssize_t)delNodesBitset.size());
+        CHECK(neighNodeId < (ptrdiff_t)delNodesBitset.size());
         if (delNodesBitset.at(neighNodeId)) {
         /* 
          * Two things to check here:
@@ -311,7 +341,7 @@ template <typename dist_t>
 void SmallWorldRand<dist_t>::CheckIDs() const
 {
   // ElList_.size() can be smaller though
-  CHECK_MSG(NextNodeId_ >= (ssize_t)ElList_.size(), 
+  CHECK_MSG(NextNodeId_ >= (ptrdiff_t)ElList_.size(), 
             "Bug NextNodeId_ = " + ConvertToString(NextNodeId_) + 
             " is < ElList_.size() = " + ConvertToString(ElList_.size()));
   vector<bool>  visitedBitset(NextNodeId_);
@@ -332,6 +362,26 @@ void SmallWorldRand<dist_t>::CheckIDs() const
     visitedBitset[nodeID]=true;
   }
 }
+
+template <typename dist_t>
+void SmallWorldRand<dist_t>::InitParamsManually(const AnyParams& IndexParams)
+{
+  AnyParamManager pmgr(IndexParams);
+
+  pmgr.GetParamOptional("NN",                 NN_,                  10);
+  pmgr.GetParamOptional("efConstruction",     efConstruction_,      NN_);
+  efSearch_ = NN_;
+  pmgr.GetParamOptional("indexThreadQty",     indexThreadQty_,      thread::hardware_concurrency());
+  pmgr.GetParamOptional("useProxyDist",       use_proxy_dist_,      false);
+
+  LOG(LIB_INFO) << "NN                  = " << NN_;
+  LOG(LIB_INFO) << "efConstruction_     = " << efConstruction_;
+  LOG(LIB_INFO) << "indexThreadQty      = " << indexThreadQty_;
+  LOG(LIB_INFO) << "useProxyDist        = " << use_proxy_dist_;
+
+  pmgr.CheckUnused();
+}
+
 
 template <typename dist_t>
 void SmallWorldRand<dist_t>::CreateIndex(const AnyParams& IndexParams) 
@@ -765,14 +815,14 @@ void SmallWorldRand<dist_t>::SaveIndex(const string &location) {
   for(ElementMap::iterator it = ElList_.begin(); it != ElList_.end(); ++it) {
     MSWNode* pNode = it->second;
     IdType nodeID = pNode->getId();
-    CHECK_MSG(nodeID >= 0 && nodeID < (ssize_t)this->data_.size(),
+    CHECK_MSG(nodeID >= 0 && nodeID < (ptrdiff_t)this->data_.size(),
               "Bug: unexpected node ID " + ConvertToString(nodeID) +
               " for object ID " + ConvertToString(pNode->getData()->id()) +
               "data_.size() = " + ConvertToString(this->data_.size()));
     outFile << nodeID << ":" << pNode->getData()->id() << ":";
     for (const MSWNode* pNodeFriend: pNode->getAllFriends()) {
       IdType nodeFriendID = pNodeFriend->getId();
-      CHECK_MSG(nodeFriendID >= 0 && nodeFriendID < (ssize_t)this->data_.size(),
+      CHECK_MSG(nodeFriendID >= 0 && nodeFriendID < (ptrdiff_t)this->data_.size(),
                 "Bug: unexpected node ID " + ConvertToString(nodeFriendID) +
                 " for object ID " + ConvertToString(pNodeFriend->getData()->id()) +
                 "data_.size() = " + ConvertToString(this->data_.size()));
@@ -819,7 +869,7 @@ void SmallWorldRand<dist_t>::LoadIndex(const string &location) {
                 string("Bug or inconsitent data, wrong format, c1=") + c1 + ",c2=" + c2 +
                 " line: " + ConvertToString(lineNum)
       );
-      CHECK_MSG(nodeID >= 0 && nodeID < (ssize_t)this->data_.size(),
+      CHECK_MSG(nodeID >= 0 && nodeID < (ptrdiff_t)this->data_.size(),
                 DATA_MUTATION_ERROR_MSG + " (unexpected node ID " + ConvertToString(nodeID) +
                 " for object ID " + ConvertToString(objID) +
                 " data_.size() = " + ConvertToString(this->data_.size()) + ")");
@@ -839,7 +889,7 @@ void SmallWorldRand<dist_t>::LoadIndex(const string &location) {
                   "Bug, got NULL pointer in the second pass for nodeID " + ConvertToString(nodeID));
         IdType nodeFriendID;
         while (str >> nodeFriendID) {
-          CHECK_MSG(nodeFriendID >= 0 && nodeFriendID < (ssize_t)this->data_.size(),
+          CHECK_MSG(nodeFriendID >= 0 && nodeFriendID < (ptrdiff_t)this->data_.size(),
                     "Bug: unexpected node ID " + ConvertToString(nodeFriendID) +
                     "data_.size() = " + ConvertToString(this->data_.size()));
           MSWNode *pFriendNode = ptrMapper[nodeFriendID];
