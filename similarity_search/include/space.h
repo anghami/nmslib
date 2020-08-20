@@ -35,7 +35,6 @@
 
 #define DIST_TYPE_INT      "int"
 #define DIST_TYPE_FLOAT    "float"
-#define DIST_TYPE_DOUBLE   "double"
 
 namespace similarity {
 
@@ -55,7 +54,6 @@ template <typename dist_t>
 const char* DistTypeName();
 
 template <> inline const char* DistTypeName<float>() { return "FLOAT"; }
-template <> inline const char* DistTypeName<double>() { return "DOUBLE"; }
 template <> inline const char* DistTypeName<int>() { return "INT"; }
 template <typename dist_t> inline const char* DistTypeName() { return typeid(dist_t).name(); }
 
@@ -110,6 +108,7 @@ struct DataFileOutputState {
 template <typename dist_t>
 class PivotIndex {
 public:
+  virtual ~PivotIndex();
   virtual void ComputePivotDistancesIndexTime(const Object* pObj, vector<dist_t>& vResDist) const = 0;
   virtual void ComputePivotDistancesQueryTime(const Query<dist_t>* pQuery, vector<dist_t>& vResDist) const = 0;
 };
@@ -122,6 +121,7 @@ class DummyPivotIndex : public PivotIndex<dist_t> {
   const Space<dist_t>&  space_;
   ObjectVector          pivots_;
 public:
+  virtual ~DummyPivotIndex();
   DummyPivotIndex(const Space<dist_t>& space, const ObjectVector pivots) : space_(space), pivots_(pivots) {}
   virtual void ComputePivotDistancesIndexTime(const Object* pObj, vector<dist_t>& vResDist) const override;
   virtual void ComputePivotDistancesQueryTime(const Query<dist_t>* pQuery, vector<dist_t>& vResDist) const override;
@@ -212,8 +212,23 @@ class Space {
                    const IdTypeUnsign MaxNumObjects = MAX_DATASET_QTY) const;
   void WriteDataset(const ObjectVector& dataset,
                    const vector<string>& vExternIds,
-                   const string& inputFile,
+                   const string& outputFile,
                    const IdTypeUnsign MaxNumObjects = MAX_DATASET_QTY) const;
+
+  /*
+   * if the space stores some useful information in the input state,
+   * it needs to override ReadObjectVectorFromBinData, and WriteObjectVectorBinData.
+   * PS: Here an assumption is that data is empty
+   */
+  virtual unique_ptr<DataFileInputState> ReadObjectVectorFromBinData(ObjectVector& dataset,
+                                                                     vector<string>& vExternIds,
+                                                                     const std::string& inputFile,
+                                                                     const IdTypeUnsign maxQty=MAX_DATASET_QTY) const;
+
+  virtual void WriteObjectVectorBinData(const ObjectVector& dataset,
+                                        const vector<string>& vExternIds,
+                                        const std::string& outputFile,
+                                        const IdTypeUnsign MaxNumObjects = MAX_DATASET_QTY) const;
 
   /*
    * For some real-valued or integer-valued *DENSE* vector spaces this function

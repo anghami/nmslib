@@ -36,14 +36,16 @@
 #include "space/space_l2sqr_sift.h"
 #include "thread_pool.h"
 
+#include "cpu_feature_guard.h"
+
 namespace py = pybind11;
 
 namespace similarity {
-const char * module_name = "nmslib";
+const char* module_name = "nmslib";
+const char* data_suff = ".dat";
 
 enum DistType {
   DISTTYPE_FLOAT,
-  DISTTYPE_DOUBLE,
   DISTTYPE_INT
 };
 
@@ -59,7 +61,7 @@ template <typename dist_t> void exportIndex(py::module * m);
 template <typename dist_t> std::string distName();
 AnyParams loadParams(py::object o);
 void exportLegacyAPI(py::module * m);
-void freeObjectVector(ObjectVector * data);
+void freeAndClearObjectVector(ObjectVector& data);
 
 // Wrap a space/objectvector/index together for ease of use
 template <typename dist_t>
@@ -93,10 +95,16 @@ struct IndexWrapper {
     index->CreateIndex(params);
   }
 
-  void loadIndex(const std::string & filename, bool print_progress = false) {
+  void loadIndex(const std::string & filename, bool load_data = false) {
     py::gil_scoped_release l;
     auto factory = MethodFactoryRegistry<dist_t>::Instance();
+    bool print_progress=false; // We are not going to creat the index anyways, only to load an existing one
     index.reset(factory.CreateMethod(print_progress, method, space_type, *space, data));
+    if (load_data) {
+      vector<string> dummy;
+      freeAndClearObjectVector(data);
+      space->ReadObjectVectorFromBinData(data, dummy, filename + data_suff);
+    }
     index->LoadIndex(filename);
 
     // querying reloaded indices don't seem to work correctly (at least hnsw ones) until
@@ -104,11 +112,15 @@ struct IndexWrapper {
     index->ResetQueryTimeParams();
   }
 
-  void saveIndex(const std::string & filename) {
+  void saveIndex(const std::string & filename, bool save_data = false) {
     if (!index) {
       throw std::invalid_argument("Must call createIndex or loadIndex before this method");
     }
     py::gil_scoped_release l;
+    if (save_data) {
+      vector<string> dummy;
+      space->WriteObjectVectorBinData(data, dummy, filename + data_suff);
+    }
     index->SaveIndex(filename);
   }
 
@@ -145,7 +157,7 @@ struct IndexWrapper {
       });
 
       // TODO(@benfred): some sort of RAII auto-destroy for this
-      freeObjectVector(&queries);
+      freeAndClearObjectVector(queries);
     }
 
     py::list ret;
@@ -174,7 +186,7 @@ struct IndexWrapper {
   const Object * readObject(py::object input, int id = 0) {
     switch (data_type) {
       case DATATYPE_DENSE_VECTOR: {
-        py::array_t<dist_t> temp(input);
+        py::array_t<dist_t, py::array::c_style | py::array::forcecast> temp(input);
         std::vector<dist_t> tempVect(temp.data(0), temp.data(0) + temp.size());
         auto vectSpacePtr = reinterpret_cast<VectorSpace<dist_t>*>(space.get());
         return vectSpacePtr->CreateObjFromVect(id, -1, tempVect);
@@ -351,7 +363,7 @@ struct IndexWrapper {
     // In cases when the interpreter was shutting down, attempting to log in python
     // could throw an exception (https://github.com/nmslib/nmslib/issues/327).
     //LOG(LIB_DEBUG) << "Destroying Index";
-    freeObjectVector(&data);
+    freeAndClearObjectVector(data);
   }
 
   std::string method;
@@ -424,6 +436,7 @@ class PythonLogger
 
 #ifdef PYBIND11_MODULE
 PYBIND11_MODULE(nmslib, m) {
+  tensorflow::port::InfoAboutUnusedCPUFeatures();
   m.doc() = "Python Bindings for Non-Metric Space Library (NMSLIB)";
 #else
 PYBIND11_PLUGIN(nmslib) {
@@ -445,7 +458,6 @@ PYBIND11_PLUGIN(nmslib) {
 
   py::enum_<DistType>(m, "DistType")
     .value("FLOAT", DISTTYPE_FLOAT)
-    .value("DOUBLE", DISTTYPE_DOUBLE)
     .value("INT", DISTTYPE_INT);
 
   py::enum_<DataType>(m, "DataType")
@@ -463,11 +475,6 @@ PYBIND11_PLUGIN(nmslib) {
       switch (dtype) {
         case DISTTYPE_FLOAT: {
           auto index = new IndexWrapper<float>(method, space, space_params, data_type, dtype);
-          ret = py::cast(index, py::return_value_policy::take_ownership);
-          break;
-        }
-        case DISTTYPE_DOUBLE: {
-          auto index = new IndexWrapper<double>(method, space, space_params, data_type, dtype);
           ret = py::cast(index, py::return_value_policy::take_ownership);
           break;
         }
@@ -498,8 +505,6 @@ PYBIND11_PLUGIN(nmslib) {
     "    The index method to use\n"
     "data_type: nmslib.DataType optional\n"
     "    The type of data to index (dense/sparse/string vectors)\n"
-    "dist_type: nmslib.DistType optional\n"
-    "    The type of index to create (float/double/int)\n"
     "\n"
     "Returns\n"
     "----------\n"
@@ -511,7 +516,6 @@ PYBIND11_PLUGIN(nmslib) {
     "Contains Indexes and Spaces for different Distance Types");
   exportIndex<int>(&dist_module);
   exportIndex<float>(&dist_module);
-  exportIndex<double>(&dist_module);
 
   exportLegacyAPI(&m);
 
@@ -573,22 +577,25 @@ void exportIndex(py::module * m) {
 
     .def("loadIndex", &IndexWrapper<dist_t>::loadIndex,
       py::arg("filename"),
-      py::arg("print_progress") = false,
+      py::arg("load_data") = false,
       "Loads the index from disk\n\n"
       "Parameters\n"
       "----------\n"
       "filename: str\n"
-      "    The filename to read from\n",
-      "print_progress: bool optional\n"
-      "    Whether or not to display progress bar when creating index\n")
+      "    The filename to read from\n"
+      "load_data: bool optional\n"
+      "    Whether or not to load previously saved data.\n")
 
     .def("saveIndex", &IndexWrapper<dist_t>::saveIndex,
       py::arg("filename"),
-      "Saves the index to disk\n\n"
+      py::arg("save_data") = false,
+      "Saves the index and/or data to disk\n\n"
       "Parameters\n"
       "----------\n"
       "filename: str\n"
-      "    The filename to save to\n")
+      "    The filename to save to\n"
+      "save_data: bool optional\n"
+      "    Whether or not to save data\n")
 
     .def("setQueryTimeParams",
       [](IndexWrapper<dist_t> * self, py::object params) {
@@ -641,12 +648,12 @@ void exportIndex(py::module * m) {
 
 template <> std::string distName<int>() { return "Int"; }
 template <> std::string distName<float>() { return "Float"; }
-template <> std::string distName<double>() { return "Double"; }
 
-void freeObjectVector(ObjectVector * data) {
-  for (auto datum : *data) {
+void freeAndClearObjectVector(ObjectVector& data) {
+  for (auto datum : data) {
     delete datum;
   }
+  data.clear();
 }
 
 AnyParams loadParams(py::object o) {
@@ -703,7 +710,6 @@ void exportLegacyAPI(py::module * m) {
     if (data_type == DATATYPE_DENSE_VECTOR) {
       DistType dist_type = py::cast<DistType>(self.attr("distType"));
       if (((dist_type == DISTTYPE_FLOAT) && (!py::isinstance<py::array_t<float>>(data)))  ||
-          ((dist_type == DISTTYPE_DOUBLE) && (!py::isinstance<py::array_t<double>>(data)))  ||
           ((dist_type == DISTTYPE_INT) && (!py::isinstance<py::array_t<int>>(data)))) {
         throw py::value_error("Invalid datatype for data in addDataPointBatch");
       }

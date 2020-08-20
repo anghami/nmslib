@@ -25,55 +25,31 @@
 #include "utils.h"
 #include "space.h"
 #include "distcomp.h"
+#include "space_bit_vector.h"
 
 #define SPACE_BIT_HAMMING "bit_hamming"
 
 namespace similarity {
 
-class SpaceBitHamming : public Space<int> {
+template <typename dist_t, typename dist_uint_t>
+class SpaceBitHamming : public SpaceBitVector<dist_t,dist_uint_t> {
  public:
   explicit SpaceBitHamming() {}
   virtual ~SpaceBitHamming() {}
 
-  /** Standard functions to read/write/create objects */ 
-  // Create an object from string representation.
-  virtual unique_ptr<Object> CreateObjFromStr(IdType id, LabelType label, const string& s,
-                                              DataFileInputState* pInpState) const;
-  // Create a string representation of an object.
-  virtual string CreateStrFromObj(const Object* pObj, const string& externId /* ignored */) const;
-  // Open a file for reading, fetch a header (if there is any) and memorize an input state
-  virtual unique_ptr<DataFileInputState> OpenReadFileHeader(const string& inputFile) const;
-  // Open a file for writing, write a header (if there is any) and memorize an output state
-  virtual unique_ptr<DataFileOutputState> OpenWriteFileHeader(const ObjectVector& dataset,
-                                                              const string& outputFile) const;
-  /*
-   * Read a string representation of the next object in a file as well
-   * as its label. Return false, on EOF.
-   */
-  virtual bool ReadNextObjStr(DataFileInputState &, string& strObj, LabelType& label, string& externId) const;
-  /** End of standard functions to read/write/create objects */
-
-  /*
-   * Used only for testing/debugging: compares objects approximately. Floating point numbers
-   * should be nearly equal. Integers and strings should coincide exactly.
-   */
-  virtual bool ApproxEqual(const Object& obj1, const Object& obj2) const;
-
   virtual std::string StrDesc() const { return "Hamming (bit-storage) space"; }
-  virtual void CreateDenseVectFromObj(const Object* obj, int* pVect,
-                                      size_t nElem) const {
-    throw runtime_error("Cannot create a dense vector for the space: " + StrDesc());
-  }
-  virtual size_t GetElemQty(const Object* object) const {return 0;}
-  virtual Object* CreateObjFromVect(IdType id, LabelType label, std::vector<uint32_t>& InpVect) const {
-    InpVect.push_back(InpVect.size());
-    return CreateObjFromVectInternal(id, label, InpVect);
-  }
+
  protected:
-  virtual Object* CreateObjFromVectInternal(IdType id, LabelType label, const std::vector<uint32_t>& InpVect) const;
-  Object* CreateObjFromBitMaskVect(IdType id, LabelType label, const std::vector<uint32_t>& bitMaskVect) const;
-  virtual int HiddenDistance(const Object* obj1, const Object* obj2) const;
-  void ReadBitMaskVect(std::string line, LabelType& label, std::vector<uint32_t>& v) const;
+  virtual dist_t HiddenDistance(const Object* obj1, const Object* obj2) const {
+    CHECK(obj1->datalength() > 0);
+    CHECK(obj1->datalength() == obj2->datalength());
+    const dist_uint_t* x = reinterpret_cast<const dist_uint_t*>(obj1->data());
+    const dist_uint_t* y = reinterpret_cast<const dist_uint_t*>(obj2->data());
+    const size_t length = obj1->datalength() / sizeof(dist_uint_t)
+                          - 1; // the last integer is an original number of elements
+
+    return BitHamming(x, y, length);
+  }
 
   DISABLE_COPY_AND_ASSIGN(SpaceBitHamming);
 };

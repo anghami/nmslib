@@ -23,8 +23,9 @@ namespace similarity {
  * Creating functions.
  */
 
-inline Space<int>* CreateBitHamming(const AnyParams& /* ignoring params */) {
-  return new SpaceBitHamming();
+template <typename dist_t, typename dist_uint_t>
+inline Space<dist_t>* CreateBitHamming(const AnyParams& /* ignoring params */) {
+  return new SpaceBitHamming<dist_t,dist_uint_t>();
 }
 
 /*

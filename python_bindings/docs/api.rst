@@ -1,6 +1,8 @@
 API Reference
 =============
 
+Information on the search methods (and their parameters) and spaces, can be found `on this page <https://github.com/nmslib/nmslib/tree/master/manual/README.md>`_.
+
 nmslib.init
 -----------
 
@@ -13,7 +15,6 @@ function should be called first before calling any other method.
 .. class:: nmslib.DistType
 
     .. attribute:: FLOAT
-    .. attribute:: DOUBLE
     .. attribute:: INT
 
 .. class:: nmslib.DataType
@@ -28,14 +29,6 @@ nmslib.FloatIndex
 nmslib.dist.FloatIndex
 
 .. autoclass:: nmslib.dist.FloatIndex
-   :members:
-
-nmslib.DoubleIndex
-------------------
-
-nmslib.dist.DoubleIndex
-
-.. autoclass:: nmslib.dist.DoubleIndex
    :members:
 
 nmslib.IntIndex

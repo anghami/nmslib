@@ -21,6 +21,9 @@
 
 // This is only for _mm_prefetch
 #include <mmintrin.h>
+#if defined(_WIN32) || defined(WIN32)
+#include <intrin.h>
+#endif
 
 #include "portable_simd.h"
 #include "space.h"
@@ -296,7 +299,6 @@ void VPTree<dist_t, SearchOracle>::VPNode::GenericSearch(QueryType* query,
 }
 
 template class VPTree<float, PolynomialPruner<float> >;
-template class VPTree<double, PolynomialPruner<double> >;
 template class VPTree<int, PolynomialPruner<int> >;
 
 }   // namespace similarity

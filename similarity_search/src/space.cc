@@ -56,9 +56,57 @@ void Space<dist_t>::WriteDataset(const ObjectVector& dataset,
   outState->Close();
 }
 
+// Doesn't support external IDs, just makes them all empty
+template <typename dist_t>
+unique_ptr<DataFileInputState>
+Space<dist_t>::ReadObjectVectorFromBinData(ObjectVector& data,
+                                           vector<string>& vExternIds,
+                                           const std::string& fileName,
+                                           const IdTypeUnsign maxQty) const {
+  CHECK_MSG(data.empty(), "this function expects data to be empty on call");
+  size_t qty;
+  size_t objSize;
+  std::ifstream input(fileName, std::ios::binary);
+  CHECK_MSG(input, "Cannot open file '" + fileName + "' for reading");
+  input.exceptions(std::ios::badbit | std::ios::failbit);
+  vExternIds.clear();
+
+  readBinaryPOD(input, qty);
+
+  for (unsigned i = 0; i < std::min(qty, size_t(maxQty)); ++i) {
+    readBinaryPOD(input, objSize);
+    unique_ptr<char []> buf(new char[objSize]);
+    input.read(&buf[0], objSize);
+    // true guarantees that the Object will take ownership of memory
+    // less than ideal, but ok for now
+    data.push_back(new Object(buf.release(), true));
+  }
+  
+  return unique_ptr<DataFileInputState>(new DataFileInputState());
+}
+
+// Doesn't support external IDs
+template <typename dist_t>
+void Space<dist_t>::WriteObjectVectorBinData(const ObjectVector& data,
+                                             const vector<string>& vExternIds,
+                                             const std::string& fileName,
+                                             const IdTypeUnsign maxQty) const {
+  std::ofstream output(fileName, std::ios::binary);
+  CHECK_MSG(output, "Cannot open file '" + fileName + "' for writing");
+  output.exceptions(std::ios::badbit | std::ios::failbit);
+
+  writeBinaryPOD(output, size_t(data.size()));
+  for (unsigned i = 0; i < std::min(data.size(), size_t(maxQty)); ++i) {
+    const Object* o = data[i];
+    writeBinaryPOD(output, o->bufferlength());
+    output.write(o->buffer(), o->bufferlength());
+  }
+  output.close();
+}
+
+
 template class Space<int>;
 template class Space<float>;
-template class Space<double>;
 
 template <class dist_t>
  void DummyPivotIndex<dist_t>::ComputePivotDistancesIndexTime(const Object* pObj, vector<dist_t>& vResDist) const  {
@@ -73,8 +121,15 @@ void DummyPivotIndex<dist_t>::ComputePivotDistancesQueryTime(const Query<dist_t>
   for (size_t i = 0; i < pivots_.size(); ++i) vResDist[i] = pQuery->DistanceObjLeft(pivots_[i]);
 }
 
+template <class dist_t>
+DummyPivotIndex<dist_t>::~DummyPivotIndex() {}
+
+template <class dist_t>
+PivotIndex<dist_t>::~PivotIndex() {}
+
+template class PivotIndex<int>;
+template class PivotIndex<float>;
 template class DummyPivotIndex<int>;
 template class DummyPivotIndex<float>;
-template class DummyPivotIndex<double>;
 
 }
